@@ -28,25 +28,10 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     private final TelegramClient telegramClient;
     private final GoogleSheetsService sheetsService;
 
-    // Хранилище состояний пользователей для создания событий
-    private final Map<Long, UserState> userStates = new ConcurrentHashMap<>();
-    private final Map<Long, EventCreationData> eventCreationData = new ConcurrentHashMap<>();
-
-    private enum UserState {
-        AWAITING_EVENT_TITLE,
-        AWAITING_EVENT_DATE,
-        AWAITING_EVENT_TIME,
-        AWAITING_EVENT_DIRECTION,
-        AWAITING_EVENT_DESCRIPTION
-    }
-
-    private static class EventCreationData {
-        String title;
-        LocalDate date;
-        LocalTime time;
-        String direction;
-        String description;
-    }
+    // Состояния пользователей: awaiting_name - ждем имя, creating_event - создаем событие
+    private final Map<Long, String> userState = new ConcurrentHashMap<>();
+    private final Map<Long, Map<String, String>> userEventData = new ConcurrentHashMap<>();
+    private final Map<Long, String> userNames = new ConcurrentHashMap<>();
 
     public UpdateConsumer(GoogleSheetsService sheetsService) {
         this.telegramClient = new OkHttpTelegramClient("8023202316:AAF0l8dhfJCB6H1eifCz2QwYW66OQlcTk7M");
@@ -57,16 +42,8 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     @Override
     public void consume(Update update) {
         try {
-            if (update.hasMessage()) {
-                String messageText = update.getMessage().getText();
-                Long chatId = update.getMessage().getChatId();
-
-                if (messageText.equals("/start")) {
-                    registerUser(update.getMessage().getFrom());
-                    sendMainMenu(chatId);
-                } else {
-                    handleUserInput(update.getMessage().getFrom().getId(), chatId, messageText);
-                }
+            if (update.hasMessage() && update.getMessage().hasText()) {
+                handleMessage(update);
             } else if (update.hasCallbackQuery()) {
                 handleCallbackQuery(update.getCallbackQuery());
             }
@@ -75,30 +52,52 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         }
     }
 
-    private void handleUserInput(Long userId, Long chatId, String messageText) throws TelegramApiException, IOException {
-        UserState state = userStates.get(userId);
+    private void handleMessage(Update update) throws TelegramApiException, IOException {
+        String messageText = update.getMessage().getText();
+        Long chatId = update.getMessage().getChatId();
+        Long userId = update.getMessage().getFrom().getId();
+        String username = update.getMessage().getFrom().getUserName();
+        String firstName = update.getMessage().getFrom().getFirstName();
+        String lastName = update.getMessage().getFrom().getLastName();
+
+        String state = userState.get(userId);
 
         if (state != null) {
-            handleUserState(userId, chatId, messageText, state);
+            handleUserState(userId, chatId, messageText, state, username, firstName, lastName);
+        } else if (messageText.equals("/start")) {
+            startRegistration(userId, chatId);
+        } else if (messageText.equals("/menu")) {
+            if (userNames.containsKey(userId)) {
+                sendMainMenu(chatId);
+            } else {
+                sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
+            }
+        } else if (messageText.equals("/cancel")) {
+            cancelOperation(userId, chatId);
         } else {
-            sendMessage(chatId, "Используйте меню для навигации или /start для главного меню");
+            if (userNames.containsKey(userId)) {
+                sendMainMenu(chatId);
+            } else {
+                sendMessage(chatId, "Пожалуйста, введите /start для начала работы");
+            }
         }
     }
 
     private void handleCallbackQuery(CallbackQuery callbackQuery) throws TelegramApiException, IOException {
-        var data = callbackQuery.getData();
-        var chatId = callbackQuery.getMessage().getChatId();
-        var userId = callbackQuery.getFrom().getId();
+        String data = callbackQuery.getData();
+        Long chatId = callbackQuery.getMessage().getChatId();
+        Long userId = callbackQuery.getFrom().getId();
 
-        // Регистрируем пользователя
-        registerUser(callbackQuery.getFrom());
+        if (!userNames.containsKey(userId)) {
+            sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
+            return;
+        }
 
         switch (data) {
             case "create_event" -> startEventCreation(userId, chatId);
-            case "subscribe" -> showAvailableEventsForSubscription(userId, chatId);
-            case "unsubscribe" -> showUserSubscriptionsForUnsubscribe(userId, chatId);
+            case "subscribe" -> showAvailableEvents(userId, chatId);
+            case "unsubscribe" -> showUserSubscriptions(userId, chatId);
             case "all_events" -> showAllEvents(chatId);
-            case "back" -> sendMainMenu(chatId);
             default -> {
                 if (data.startsWith("subscribe_")) {
                     Long eventId = Long.parseLong(data.substring(10));
@@ -106,172 +105,152 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 } else if (data.startsWith("unsubscribe_")) {
                     Long eventId = Long.parseLong(data.substring(12));
                     unsubscribeFromEvent(userId, chatId, eventId);
-                } else {
-                    sendMessage(chatId, "Неизвестная команда");
                 }
             }
         }
     }
 
-    private void handleUserState(Long userId, Long chatId, String messageText, UserState state)
+    private void handleUserState(Long userId, Long chatId, String messageText, String state,
+                                 String username, String firstName, String lastName)
             throws TelegramApiException, IOException {
 
         switch (state) {
-            case AWAITING_EVENT_TITLE -> {
-                EventCreationData data = new EventCreationData();
-                data.title = messageText;
-                eventCreationData.put(userId, data);
-                userStates.put(userId, UserState.AWAITING_EVENT_DATE);
-                sendMessage(chatId, "📅 Введите дату сбора в формате ДД.ММ.ГГГГ\nНапример: 25.12.2024");
+            case "awaiting_name" -> {
+                String userName = messageText.trim();
+                if (userName.isEmpty()) {
+                    sendMessage(chatId, "Имя не может быть пустым. Пожалуйста, введите ваше имя:");
+                    return;
+                }
+
+                userNames.put(userId, userName);
+                userState.remove(userId);
+
+                // Регистрируем пользователя в Google Sheets
+                if (!sheetsService.userExists(userId)) {
+                    sheetsService.addUser(userId, username, userName);
+                }
+
+                sendMessage(chatId, "Добро пожаловать, " + userName + "!");
+                sendMainMenu(chatId);
             }
 
-            case AWAITING_EVENT_DATE -> {
+            case "awaiting_event_title" -> {
+                Map<String, String> eventData = new HashMap<>();
+                eventData.put("title", messageText);
+                userEventData.put(userId, eventData);
+                userState.put(userId, "awaiting_event_date");
+                sendMessage(chatId, "Введите дату сбора в формате ДД.ММ.ГГГГ\nНапример: 25.12.2024");
+            }
+
+            case "awaiting_event_date" -> {
                 try {
                     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy");
-                    LocalDate date = LocalDate.parse(messageText, formatter);
+                    LocalDate.parse(messageText, formatter);
 
-                    if (date.isBefore(LocalDate.now())) {
-                        sendMessage(chatId, "❌ Дата не может быть в прошлом! Введите корректную дату:");
-                        return;
-                    }
-
-                    EventCreationData data = eventCreationData.get(userId);
-                    data.date = date;
-                    userStates.put(userId, UserState.AWAITING_EVENT_TIME);
-                    sendMessage(chatId, "⏰ Введите время сбора в формате ЧЧ:ММ\nНапример: 18:30");
+                    Map<String, String> eventData = userEventData.get(userId);
+                    eventData.put("date", messageText);
+                    userState.put(userId, "awaiting_event_time");
+                    sendMessage(chatId, "Введите время сбора в формате ЧЧ:ММ\nНапример: 18:30");
                 } catch (DateTimeParseException e) {
-                    sendMessage(chatId, "❌ Неверный формат даты! Введите дату в формате ДД.ММ.ГГГГ:");
+                    sendMessage(chatId, "Неверный формат даты! Введите дату в формате ДД.ММ.ГГГГ:");
                 }
             }
 
-            case AWAITING_EVENT_TIME -> {
+            case "awaiting_event_time" -> {
                 try {
                     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
-                    LocalTime time = LocalTime.parse(messageText, formatter);
+                    LocalTime.parse(messageText, formatter);
 
-                    EventCreationData data = eventCreationData.get(userId);
-                    data.time = time;
-                    userStates.put(userId, UserState.AWAITING_EVENT_DIRECTION);
-                    sendMessage(chatId, "📍 Введите направление сбора (например: Футбол, Волейбол, Баскетбол):");
+                    Map<String, String> eventData = userEventData.get(userId);
+                    eventData.put("time", messageText);
+                    userState.put(userId, "awaiting_event_location");
+                    sendMessage(chatId, "Введите место проведения сбора:");
                 } catch (DateTimeParseException e) {
-                    sendMessage(chatId, "❌ Неверный формат времени! Введите время в формате ЧЧ:ММ:");
+                    sendMessage(chatId, "Неверный формат времени! Введите время в формате ЧЧ:ММ:");
                 }
             }
 
-            case AWAITING_EVENT_DIRECTION -> {
-                EventCreationData data = eventCreationData.get(userId);
-                data.direction = messageText;
-                userStates.put(userId, UserState.AWAITING_EVENT_DESCRIPTION);
-                sendMessage(chatId, "📝 Введите описание сбора (можно пропустить, отправив \"-\"):");
-            }
+            case "awaiting_event_location" -> {
+                Map<String, String> eventData = userEventData.get(userId);
+                eventData.put("location", messageText);
 
-            case AWAITING_EVENT_DESCRIPTION -> {
-                EventCreationData data = eventCreationData.get(userId);
-                data.description = messageText.equals("-") ? null : messageText;
-
-                // Создаем событие в Google Sheets
-                createEventInSheets(userId, data, chatId);
+                // Сохраняем событие
+                createEvent(userId, chatId, eventData);
 
                 // Очищаем состояние
-                userStates.remove(userId);
-                eventCreationData.remove(userId);
+                userState.remove(userId);
+                userEventData.remove(userId);
             }
         }
     }
 
-    private void registerUser(org.telegram.telegrambots.meta.api.objects.User telegramUser) throws IOException {
-        // Проверяем, есть ли пользователь уже в Google Sheets
-        Map<String, String> existingUser = sheetsService.findUserByTelegramId(telegramUser.getId());
-
-        if (existingUser == null) {
-            System.out.println("Регистрация нового пользователя: " + telegramUser.getId());
-
-            Map<String, Object> userData = new HashMap<>();
-            userData.put("telegramId", telegramUser.getId());
-            userData.put("username", telegramUser.getUserName() != null ? telegramUser.getUserName() : "");
-            userData.put("firstName", telegramUser.getFirstName() != null ? telegramUser.getFirstName() : "");
-            userData.put("lastName", telegramUser.getLastName() != null ? telegramUser.getLastName() : "");
-            userData.put("registeredAt", LocalDateTime.now().toString());
-
-            sheetsService.addUser(userData);
-            System.out.println("Пользователь зарегистрирован в Google Sheets");
-        }
-    }
-
-    private void createEventInSheets(Long userId, EventCreationData data, Long chatId) throws IOException, TelegramApiException {
-        try {
-            System.out.println("Создание события от пользователя: " + userId);
-
-            Map<String, Object> eventData = new HashMap<>();
-            eventData.put("title", data.title);
-            eventData.put("description", data.description != null ? data.description : "");
-            eventData.put("date", data.date.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")));
-            eventData.put("time", data.time.format(DateTimeFormatter.ofPattern("HH:mm")));
-            eventData.put("direction", data.direction);
-            eventData.put("createdBy", userId);
-            eventData.put("createdAt", LocalDateTime.now().toString());
-            eventData.put("isActive", "TRUE");
-
-            sheetsService.addEvent(eventData);
-
-            sendMessage(chatId, "✅ Сбор успешно создан!\n\n" +
-                    "📅 *" + data.title + "*\n" +
-                    "🗓 Дата: " + data.date.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + "\n" +
-                    "⏰ Время: " + data.time.format(DateTimeFormatter.ofPattern("HH:mm")) + "\n" +
-                    "📍 Направление: " + data.direction + "\n" +
-                    (data.description != null ? "📝 " + data.description + "\n" : "") +
-                    "\nПодписчики будут уведомлены за час до начала.");
-
-        } catch (Exception e) {
-            System.err.println("Ошибка при создании события: " + e.getMessage());
-            e.printStackTrace();
-            sendMessage(chatId, "❌ Ошибка при создании сбора: " + e.getMessage());
-        }
+    private void startRegistration(Long userId, Long chatId) throws TelegramApiException {
+        userState.put(userId, "awaiting_name");
+        sendMessage(chatId, "Добро пожаловать! Для начала работы, пожалуйста, введите ваше имя:");
     }
 
     private void startEventCreation(Long userId, Long chatId) throws TelegramApiException {
-        userStates.put(userId, UserState.AWAITING_EVENT_TITLE);
-        sendMessage(chatId, "🏁 Давайте создадим новый сбор!\n\nВведите название сбора:");
+        userState.put(userId, "awaiting_event_title");
+        sendMessage(chatId, "Создание нового сбора. Введите название сбора:");
     }
 
-    private void showAvailableEventsForSubscription(Long userId, Long chatId) throws TelegramApiException, IOException {
-        System.out.println("Показ доступных событий для подписки для пользователя: " + userId);
+    private void createEvent(Long userId, Long chatId, Map<String, String> eventData)
+            throws TelegramApiException, IOException {
+        try {
+            String userName = userNames.get(userId);
+            Long eventId = sheetsService.addEvent(
+                    eventData.get("title"),
+                    eventData.get("date"),
+                    eventData.get("time"),
+                    eventData.get("location"),
+                    userId,
+                    userName
+            );
 
-        List<Map<String, String>> allEvents = sheetsService.getActiveEvents();
+            sendMessage(chatId, "Сбор успешно создан!\n\n" +
+                    "Название: " + eventData.get("title") + "\n" +
+                    "Дата: " + eventData.get("date") + "\n" +
+                    "Время: " + eventData.get("time") + "\n" +
+                    "Место: " + eventData.get("location"));
+
+            sendMainMenu(chatId);
+
+        } catch (Exception e) {
+            sendMessage(chatId, "Ошибка при создании сбора: " + e.getMessage());
+        }
+    }
+
+    private void showAvailableEvents(Long userId, Long chatId) throws TelegramApiException, IOException {
+        List<Map<String, String>> events = sheetsService.getActiveEvents();
         List<Map<String, String>> userSubscriptions = sheetsService.getUserSubscriptions(userId);
 
-        // Фильтруем события, на которые пользователь уже подписан
+        // Фильтруем события, на которые пользователь не подписан
         Set<String> subscribedEventIds = new HashSet<>();
         for (Map<String, String> sub : userSubscriptions) {
             subscribedEventIds.add(sub.get("Event ID"));
         }
 
         List<Map<String, String>> availableEvents = new ArrayList<>();
-        for (Map<String, String> event : allEvents) {
+        for (Map<String, String> event : events) {
             if (!subscribedEventIds.contains(event.get("ID"))) {
                 availableEvents.add(event);
             }
         }
 
         if (availableEvents.isEmpty()) {
-            sendMessage(chatId, "📭 Нет доступных сборов для подписки.");
+            sendMessage(chatId, "Нет доступных сборов для подписки.");
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("📋 Доступные сборы для подписки:")
+                .text("Доступные сборы для подписки:")
                 .build();
 
-        List<InlineKeyboardRow> keyboardRows = new ArrayList<>();
+        List<InlineKeyboardRow> rows = new ArrayList<>();
 
         for (Map<String, String> event : availableEvents) {
-            String buttonText = String.format("%s - %s %s",
-                    event.get("Title"),
-                    event.get("Date"),
-                    event.get("Time")
-            );
-
+            String buttonText = event.get("Title") + " - " + event.get("Date") + " " + event.get("Time");
             if (buttonText.length() > 64) {
                 buttonText = buttonText.substring(0, 61) + "...";
             }
@@ -281,168 +260,124 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     .callbackData("subscribe_" + event.get("ID"))
                     .build();
 
-            keyboardRows.add(new InlineKeyboardRow(button));
+            rows.add(new InlineKeyboardRow(button));
         }
 
-        // Кнопка "Назад"
         InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("⬅️ Назад в меню")
+                .text("Назад")
                 .callbackData("back")
                 .build();
-        keyboardRows.add(new InlineKeyboardRow(backButton));
+        rows.add(new InlineKeyboardRow(backButton));
 
-        message.setReplyMarkup(new InlineKeyboardMarkup(keyboardRows));
+        message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
-    private void showUserSubscriptionsForUnsubscribe(Long userId, Long chatId) throws TelegramApiException, IOException {
-        System.out.println("Показ подписок пользователя: " + userId);
-
+    private void showUserSubscriptions(Long userId, Long chatId) throws TelegramApiException, IOException {
         List<Map<String, String>> userSubscriptions = sheetsService.getUserSubscriptions(userId);
 
         if (userSubscriptions.isEmpty()) {
-            sendMessage(chatId, "📭 Вы не подписаны ни на один сбор.");
+            sendMessage(chatId, "Вы не подписаны ни на один сбор.");
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("📋 Ваши подписки:")
+                .text("Ваши подписки:")
                 .build();
 
-        List<InlineKeyboardRow> keyboardRows = new ArrayList<>();
+        List<InlineKeyboardRow> rows = new ArrayList<>();
 
         for (Map<String, String> sub : userSubscriptions) {
-            // Получаем информацию о событии
-            List<Map<String, String>> events = sheetsService.getEvents();
-            Map<String, String> event = null;
-            for (Map<String, String> e : events) {
-                if (e.get("ID").equals(sub.get("Event ID"))) {
-                    event = e;
+            // Находим событие
+            List<Map<String, String>> events = sheetsService.getAllEvents();
+            for (Map<String, String> event : events) {
+                if (event.get("ID").equals(sub.get("Event ID"))) {
+                    String buttonText = event.get("Title") + " - " + event.get("Date") + " " + event.get("Time");
+                    if (buttonText.length() > 64) {
+                        buttonText = buttonText.substring(0, 61) + "...";
+                    }
+
+                    InlineKeyboardButton button = InlineKeyboardButton.builder()
+                            .text(buttonText)
+                            .callbackData("unsubscribe_" + event.get("ID"))
+                            .build();
+
+                    rows.add(new InlineKeyboardRow(button));
                     break;
                 }
             }
-
-            if (event != null) {
-                String buttonText = String.format("❌ %s - %s %s",
-                        event.get("Title"),
-                        event.get("Date"),
-                        event.get("Time")
-                );
-
-                if (buttonText.length() > 64) {
-                    buttonText = buttonText.substring(0, 61) + "...";
-                }
-
-                InlineKeyboardButton button = InlineKeyboardButton.builder()
-                        .text(buttonText)
-                        .callbackData("unsubscribe_" + event.get("ID"))
-                        .build();
-
-                keyboardRows.add(new InlineKeyboardRow(button));
-            }
         }
 
-        // Кнопка "Назад"
         InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("⬅️ Назад в меню")
+                .text("Назад")
                 .callbackData("back")
                 .build();
-        keyboardRows.add(new InlineKeyboardRow(backButton));
+        rows.add(new InlineKeyboardRow(backButton));
 
-        message.setReplyMarkup(new InlineKeyboardMarkup(keyboardRows));
+        message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showAllEvents(Long chatId) throws TelegramApiException, IOException {
-        System.out.println("Показ всех событий");
-
         List<Map<String, String>> events = sheetsService.getActiveEvents();
 
         if (events.isEmpty()) {
-            sendMessage(chatId, "📭 Нет запланированных сборов.");
+            sendMessage(chatId, "Нет запланированных сборов.");
             return;
         }
 
-        StringBuilder messageText = new StringBuilder("📅 Все сборы:\n\n");
+        StringBuilder messageText = new StringBuilder("Все сборы:\n\n");
 
         for (Map<String, String> event : events) {
-            messageText.append("📅 *").append(event.get("Title")).append("*\n")
-                    .append("🗓 Дата: ").append(event.get("Date")).append("\n")
-                    .append("⏰ Время: ").append(event.get("Time")).append("\n")
-                    .append("📍 Направление: ").append(event.get("Direction")).append("\n")
-                    .append("🔢 ID: `").append(event.get("ID")).append("`\n");
-
-            if (event.get("Description") != null && !event.get("Description").isEmpty()) {
-                messageText.append("📝 ").append(event.get("Description")).append("\n");
-            }
-
-            messageText.append("\n");
+            messageText.append("Название: ").append(event.get("Title")).append("\n")
+                    .append("Дата: ").append(event.get("Date")).append("\n")
+                    .append("Время: ").append(event.get("Time")).append("\n")
+                    .append("Место: ").append(event.get("Location")).append("\n")
+                    .append("Подписчиков: ").append(event.get("Subs Number")).append("\n\n");
         }
 
-        SendMessage message = SendMessage.builder()
-                .chatId(chatId)
-                .text(messageText.toString())
-                .parseMode("Markdown")
-                .build();
-
-        telegramClient.execute(message);
+        sendMessage(chatId, messageText.toString());
     }
 
     private void subscribeToEvent(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
-            System.out.println("Пользователь " + userId + " подписывается на событие " + eventId);
-
-            // Проверяем, не подписан ли уже
-            List<Map<String, String>> userSubs = sheetsService.getUserSubscriptions(userId);
-            boolean alreadySubscribed = false;
-            for (Map<String, String> sub : userSubs) {
-                if (String.valueOf(eventId).equals(sub.get("Event ID"))) {
-                    alreadySubscribed = true;
-                    break;
-                }
-            }
-
-            if (alreadySubscribed) {
-                sendMessage(chatId, "❌ Вы уже подписаны на этот сбор.");
+            if (sheetsService.isUserSubscribed(userId, eventId)) {
+                sendMessage(chatId, "Вы уже подписаны на этот сбор.");
                 return;
             }
 
-            Map<String, Object> subscriptionData = new HashMap<>();
-            subscriptionData.put("userId", userId);
-            subscriptionData.put("eventId", eventId);
-            subscriptionData.put("subscribedAt", LocalDateTime.now().toString());
-
-            sheetsService.addSubscription(subscriptionData);
-
-            sendMessage(chatId, "✅ Вы успешно подписались на сбор!");
+            String userName = userNames.get(userId);
+            sheetsService.addSubscription(userId, eventId, userName);
+            sendMessage(chatId, "Вы успешно подписались на сбор!");
+            sendMainMenu(chatId);
 
         } catch (Exception e) {
-            System.err.println("Ошибка при подписке: " + e.getMessage());
-            e.printStackTrace();
-            sendMessage(chatId, "❌ Ошибка при подписке: " + e.getMessage());
+            sendMessage(chatId, "Ошибка при подписке: " + e.getMessage());
         }
     }
 
     private void unsubscribeFromEvent(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
-            System.out.println("Пользователь " + userId + " отписывается от события " + eventId);
-
             sheetsService.deleteSubscription(userId, eventId);
-            sendMessage(chatId, "✅ Вы отписались от сбора.");
-
+            sendMessage(chatId, "Вы отписались от сбора.");
+            sendMainMenu(chatId);
         } catch (Exception e) {
-            System.err.println("Ошибка при отписке: " + e.getMessage());
-            e.printStackTrace();
-            sendMessage(chatId, "❌ Ошибка при отписке: " + e.getMessage());
+            sendMessage(chatId, "Ошибка при отписке: " + e.getMessage());
         }
+    }
+
+    private void cancelOperation(Long userId, Long chatId) throws TelegramApiException {
+        userState.remove(userId);
+        userEventData.remove(userId);
+        sendMessage(chatId, "Операция отменена.");
+        sendMainMenu(chatId);
     }
 
     private void sendMessage(Long chatId, String messageText) throws TelegramApiException {
         SendMessage message = SendMessage.builder()
                 .text(messageText)
                 .chatId(chatId)
-                .parseMode("Markdown")
                 .build();
 
         try {
@@ -454,27 +389,27 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
     private void sendMainMenu(Long chatId) throws TelegramApiException {
         SendMessage message = SendMessage.builder()
-                .text("🏠 Главное меню")
+                .text("Главное меню")
                 .chatId(chatId)
                 .build();
 
         var button1 = InlineKeyboardButton.builder()
-                .text("➕ Создать сбор")
+                .text("Создать сбор")
                 .callbackData("create_event")
                 .build();
 
         var button2 = InlineKeyboardButton.builder()
-                .text("📋 Подписаться на сбор")
+                .text("Подписаться на сбор")
                 .callbackData("subscribe")
                 .build();
 
         var button3 = InlineKeyboardButton.builder()
-                .text("❌ Отписаться от сбора")
+                .text("Отписаться от сбора")
                 .callbackData("unsubscribe")
                 .build();
 
         var button4 = InlineKeyboardButton.builder()
-                .text("🗓 Посмотреть расписание")
+                .text("Посмотреть расписание")
                 .callbackData("all_events")
                 .build();
 

@@ -1,276 +1,188 @@
 package com.example.fkrscheduletgbot.service;
 
-import com.google.api.client.auth.oauth2.Credential;
 import com.google.api.client.googleapis.auth.oauth2.GoogleCredential;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
-import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.gson.GsonFactory;
 import com.google.api.services.sheets.v4.Sheets;
 import com.google.api.services.sheets.v4.SheetsScopes;
 import com.google.api.services.sheets.v4.model.*;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 @Service
 public class GoogleSheetsService {
 
-    // Жёстко заданный ID таблицы
-    private final String spreadsheetId = "1p988SQ0sitghK-HOPzBIA4CjQYonKqUA5qp3vS99OgM";
-
-    private static final String APPLICATION_NAME = "Telegram Schedule Bot";
-    private static final JsonFactory JSON_FACTORY = GsonFactory.getDefaultInstance();
-    private static final List<String> SCOPES = Arrays.asList(
-            SheetsScopes.SPREADSHEETS,
-            SheetsScopes.DRIVE
-    );
-
+    private static final String SPREADSHEET_ID = "1p988SQ0sitghK-HOPzBIA4CjQYonKqUA5qp3vS99OgM";
     private Sheets sheetsService;
 
     public GoogleSheetsService() {
-        System.out.println("=== КОНСТРУКТОР GOOGLE SHEETS SERVICE ===");
-        System.out.println("Spreadsheet ID: " + spreadsheetId);
-
+        System.out.println("=== СОЗДАНИЕ GOOGLE SHEETS SERVICE ===");
         try {
-            initializeSheetsService();
-            initializeSheets();
-            System.out.println("=== GOOGLE SHEETS SERVICE УСПЕШНО ИНИЦИАЛИЗИРОВАН ===");
+            init();
+            System.out.println("Google Sheets Service готов к работе!");
         } catch (Exception e) {
-            System.err.println("ОШИБКА при инициализации Google Sheets:");
+            System.err.println("ФАТАЛЬНАЯ ОШИБКА при создании Google Sheets Service:");
             e.printStackTrace();
         }
     }
 
-    private void initializeSheetsService() throws GeneralSecurityException, IOException {
-        System.out.println("=== ИНИЦИАЛИЗАЦИЯ GOOGLE SHEETS API ===");
+    private void init() throws GeneralSecurityException, IOException {
         final NetHttpTransport httpTransport = GoogleNetHttpTransport.newTrustedTransport();
 
-        // Загружаем credentials из resources
         GoogleCredential credential = GoogleCredential.fromStream(
                         new ClassPathResource("credentials.json").getInputStream())
-                .createScoped(SCOPES);
+                .createScoped(Arrays.asList(SheetsScopes.SPREADSHEETS));
 
-        sheetsService = new Sheets.Builder(httpTransport, JSON_FACTORY, credential)
-                .setApplicationName(APPLICATION_NAME)
+        sheetsService = new Sheets.Builder(httpTransport, GsonFactory.getDefaultInstance(), credential)
+                .setApplicationName("Telegram Schedule Bot")
                 .build();
-        System.out.println("Google Sheets API успешно инициализирован");
+
+        createSheetsIfNeeded();
     }
 
-    private void initializeSheets() throws IOException {
-        System.out.println("=== СОЗДАНИЕ ЛИСТОВ В GOOGLE SHEETS ===");
-        System.out.println("Spreadsheet ID: " + spreadsheetId);
+    // ========== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ ==========
 
-        try {
-            Spreadsheet spreadsheet = sheetsService.spreadsheets().get(spreadsheetId).execute();
-            System.out.println("Текущие листы в таблице:");
+    public void addUser(Long telegramId, String username, String name) throws IOException {
+        Long nextId = getNextId("Users");
 
-            for (Sheet sheet : spreadsheet.getSheets()) {
-                System.out.println("- " + sheet.getProperties().getTitle());
+        List<List<Object>> values = Arrays.asList(Arrays.asList(
+                nextId,
+                telegramId,
+                username != null ? username : "",
+                name,
+                LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
+        ));
+
+        ValueRange body = new ValueRange().setValues(values);
+        sheetsService.spreadsheets().values()
+                .append(SPREADSHEET_ID, "Users!A:E", body)
+                .setValueInputOption("RAW")
+                .execute();
+    }
+
+    public boolean userExists(Long telegramId) throws IOException {
+        List<Map<String, String>> users = getAllRows("Users");
+        return users.stream()
+                .anyMatch(user -> String.valueOf(telegramId).equals(user.get("Telegram ID")));
+    }
+
+    public String getUserName(Long telegramId) throws IOException {
+        List<Map<String, String>> users = getAllRows("Users");
+        for (Map<String, String> user : users) {
+            if (String.valueOf(telegramId).equals(user.get("Telegram ID"))) {
+                return user.get("Name");
             }
-
-            // Создаем заголовки для таблиц
-            System.out.println("Создание листа Users...");
-            createSheetIfNotExists("Users", Arrays.asList(
-                    "ID", "Telegram ID", "Username", "First Name", "Last Name", "Registered At"
-            ));
-
-            System.out.println("Создание листа Events...");
-            createSheetIfNotExists("Events", Arrays.asList(
-                    "ID", "Title", "Description", "Date", "Time", "Direction",
-                    "Created By", "Created At", "Is Active"
-            ));
-
-            System.out.println("Создание листа Subscriptions...");
-            createSheetIfNotExists("Subscriptions", Arrays.asList(
-                    "ID", "User ID", "Event ID", "Subscribed At"
-            ));
-
-            System.out.println("=== ЛИСТЫ УСПЕШНО СОЗДАНЫ ===");
-        } catch (Exception e) {
-            System.err.println("Ошибка при создании листов: " + e.getMessage());
-            e.printStackTrace();
-            throw e;
         }
+        return "Неизвестный";
     }
 
-    private void createSheetIfNotExists(String sheetName, List<String> headers) throws IOException {
-        Spreadsheet spreadsheet = sheetsService.spreadsheets().get(spreadsheetId).execute();
+    // ========== РАБОТА СО СОБЫТИЯМИ ==========
 
-        // Проверяем, существует ли лист
-        boolean sheetExists = false;
-        for (Sheet sheet : spreadsheet.getSheets()) {
-            if (sheetName.equals(sheet.getProperties().getTitle())) {
-                sheetExists = true;
-                System.out.println("Лист '" + sheetName + "' уже существует");
+    public Long addEvent(String title, String date, String time, String location,
+                         Long createdBy, String creatorName) throws IOException {
+        Long nextId = getNextId("Events");
+
+        // Создаем событие с 0 подписчиков
+        List<List<Object>> values = Arrays.asList(Arrays.asList(
+                nextId,
+                title,
+                date,
+                time,
+                location,
+                createdBy,
+                0, // Начальное количество подписчиков
+                LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
+        ));
+
+        ValueRange body = new ValueRange().setValues(values);
+        sheetsService.spreadsheets().values()
+                .append(SPREADSHEET_ID, "Events!A:H", body)
+                .setValueInputOption("RAW")
+                .execute();
+
+        return nextId;
+    }
+
+    public void updateEventSubscribers(Long eventId, int subscriberCount) throws IOException {
+        List<Map<String, String>> events = getAllRows("Events");
+
+        for (int i = 0; i < events.size(); i++) {
+            Map<String, String> event = events.get(i);
+            if (String.valueOf(eventId).equals(event.get("ID"))) {
+                // Обновляем строку (i+2 т.к. первая строка заголовки)
+                updateEventRow(i + 2, event, subscriberCount);
                 break;
             }
         }
-
-        if (!sheetExists) {
-            System.out.println("Создание нового листа: " + sheetName);
-
-            // Создаем новый лист
-            AddSheetRequest addSheetRequest = new AddSheetRequest();
-            SheetProperties sheetProperties = new SheetProperties();
-            sheetProperties.setTitle(sheetName);
-            addSheetRequest.setProperties(sheetProperties);
-
-            BatchUpdateSpreadsheetRequest batchUpdateRequest = new BatchUpdateSpreadsheetRequest();
-            batchUpdateRequest.setRequests(Collections.singletonList(
-                    new Request().setAddSheet(addSheetRequest)
-            ));
-
-            sheetsService.spreadsheets().batchUpdate(spreadsheetId, batchUpdateRequest).execute();
-
-            // Добавляем заголовки
-            ValueRange headerRow = new ValueRange();
-            List<List<Object>> values = new ArrayList<>();
-            values.add(new ArrayList<>(headers));
-            headerRow.setValues(values);
-
-            sheetsService.spreadsheets().values()
-                    .update(spreadsheetId, sheetName + "!A1", headerRow)
-                    .setValueInputOption("RAW")
-                    .execute();
-
-            System.out.println("Лист '" + sheetName + "' успешно создан с заголовками");
-        }
     }
 
-    // ===== Методы для работы с пользователями =====
+    private void updateEventRow(int rowIndex, Map<String, String> eventData, int subscriberCount) throws IOException {
+        List<Object> row = Arrays.asList(
+                eventData.get("ID"),
+                eventData.get("Title"),
+                eventData.get("Date"),
+                eventData.get("Time"),
+                eventData.get("Location"),
+                eventData.get("Created By"),
+                subscriberCount,
+                eventData.get("Created At")
+        );
 
-    public void addUser(Map<String, Object> userData) throws IOException {
-        System.out.println("Добавление пользователя в Google Sheets: " + userData.get("telegramId"));
-
-        List<List<Object>> values = Arrays.asList(Arrays.asList(
-                getNextId("Users"),
-                userData.get("telegramId"),
-                userData.get("username"),
-                userData.get("firstName"),
-                userData.get("lastName"),
-                userData.get("registeredAt")
-        ));
-
+        List<List<Object>> values = Arrays.asList(row);
         ValueRange body = new ValueRange().setValues(values);
+
         sheetsService.spreadsheets().values()
-                .append(spreadsheetId, "Users!A:F", body)
+                .update(SPREADSHEET_ID, "Events!A" + rowIndex + ":H" + rowIndex, body)
                 .setValueInputOption("RAW")
                 .execute();
-
-        System.out.println("Пользователь добавлен");
     }
 
-    public List<Map<String, String>> getUsers() throws IOException {
-        return getSheetData("Users");
-    }
-
-    public Map<String, String> findUserByTelegramId(Long telegramId) throws IOException {
-        List<Map<String, String>> users = getUsers();
-        for (Map<String, String> user : users) {
-            if (String.valueOf(telegramId).equals(user.get("Telegram ID"))) {
-                return user;
-            }
-        }
-        return null;
-    }
-
-    // ===== Методы для работы с событиями =====
-
-    public void addEvent(Map<String, Object> eventData) throws IOException {
-        System.out.println("Добавление события в Google Sheets: " + eventData.get("title"));
-
-        List<List<Object>> values = Arrays.asList(Arrays.asList(
-                getNextId("Events"),
-                eventData.get("title"),
-                eventData.get("description"),
-                eventData.get("date"),
-                eventData.get("time"),
-                eventData.get("direction"),
-                eventData.get("createdBy"),
-                eventData.get("createdAt"),
-                eventData.get("isActive")
-        ));
-
-        ValueRange body = new ValueRange().setValues(values);
-        sheetsService.spreadsheets().values()
-                .append(spreadsheetId, "Events!A:I", body)
-                .setValueInputOption("RAW")
-                .execute();
-
-        System.out.println("Событие добавлено");
-    }
-
-    public List<Map<String, String>> getEvents() throws IOException {
-        return getSheetData("Events");
+    public List<Map<String, String>> getAllEvents() throws IOException {
+        return getAllRows("Events");
     }
 
     public List<Map<String, String>> getActiveEvents() throws IOException {
-        List<Map<String, String>> events = getEvents();
-        List<Map<String, String>> activeEvents = new ArrayList<>();
-
-        for (Map<String, String> event : events) {
-            if ("TRUE".equalsIgnoreCase(event.get("Is Active")) || "true".equalsIgnoreCase(event.get("Is Active"))) {
-                activeEvents.add(event);
-            }
-        }
-
-        return activeEvents;
+        // Все события активны, просто возвращаем все
+        return getAllEvents();
     }
 
-    // ===== Методы для работы с подписками =====
+    // ========== РАБОТА С ПОДПИСКАМИ ==========
 
-    public void addSubscription(Map<String, Object> subscriptionData) throws IOException {
-        System.out.println("Добавление подписки в Google Sheets");
+    public void addSubscription(Long userId, Long eventId, String userName) throws IOException {
+        Long nextId = getNextId("Subscriptions");
 
         List<List<Object>> values = Arrays.asList(Arrays.asList(
-                getNextId("Subscriptions"),
-                subscriptionData.get("userId"),
-                subscriptionData.get("eventId"),
-                subscriptionData.get("subscribedAt")
+                nextId,
+                userName,
+                eventId,
+                LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
         ));
 
         ValueRange body = new ValueRange().setValues(values);
         sheetsService.spreadsheets().values()
-                .append(spreadsheetId, "Subscriptions!A:D", body)
+                .append(SPREADSHEET_ID, "Subscriptions!A:D", body)
                 .setValueInputOption("RAW")
                 .execute();
 
-        System.out.println("Подписка добавлена");
-    }
-
-    public List<Map<String, String>> getSubscriptions() throws IOException {
-        return getSheetData("Subscriptions");
-    }
-
-    public void deleteSubscription(Long userId, Long eventId) throws IOException {
-        System.out.println("Удаление подписки: userId=" + userId + ", eventId=" + eventId);
-
-        List<Map<String, String>> subscriptions = getSubscriptions();
-
-        for (int i = 0; i < subscriptions.size(); i++) {
-            Map<String, String> sub = subscriptions.get(i);
-            if (String.valueOf(userId).equals(sub.get("User ID")) &&
-                    String.valueOf(eventId).equals(sub.get("Event ID"))) {
-
-                // Находим и удаляем строку (i+2 т.к. первая строка - заголовки)
-                deleteRow("Subscriptions", i + 2);
-                System.out.println("Подписка удалена");
-                break;
-            }
-        }
+        // Обновляем количество подписчиков в событии
+        int subscriberCount = getEventSubscribersCount(eventId);
+        updateEventSubscribers(eventId, subscriberCount);
     }
 
     public List<Map<String, String>> getUserSubscriptions(Long userId) throws IOException {
-        List<Map<String, String>> allSubscriptions = getSubscriptions();
+        List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
         List<Map<String, String>> userSubscriptions = new ArrayList<>();
+        String userName = getUserName(userId);
 
         for (Map<String, String> sub : allSubscriptions) {
-            if (String.valueOf(userId).equals(sub.get("User ID"))) {
+            if (userName.equals(sub.get("Name"))) {
                 userSubscriptions.add(sub);
             }
         }
@@ -278,11 +190,122 @@ public class GoogleSheetsService {
         return userSubscriptions;
     }
 
-    // ===== Вспомогательные методы =====
+    public boolean isUserSubscribed(Long userId, Long eventId) throws IOException {
+        List<Map<String, String>> subscriptions = getUserSubscriptions(userId);
+        String userName = getUserName(userId);
 
-    private List<Map<String, String>> getSheetData(String sheetName) throws IOException {
+        return subscriptions.stream()
+                .anyMatch(sub -> userName.equals(sub.get("Name")) &&
+                        String.valueOf(eventId).equals(sub.get("Event ID")));
+    }
+
+    public void deleteSubscription(Long userId, Long eventId) throws IOException {
+        List<Map<String, String>> subscriptions = getAllRows("Subscriptions");
+        String userName = getUserName(userId);
+
+        for (int i = 0; i < subscriptions.size(); i++) {
+            Map<String, String> sub = subscriptions.get(i);
+            if (userName.equals(sub.get("Name")) &&
+                    String.valueOf(eventId).equals(sub.get("Event ID"))) {
+
+                deleteRow("Subscriptions", i + 2); // +2 потому что первая строка заголовки
+
+                // Обновляем количество подписчиков в событии
+                int subscriberCount = getEventSubscribersCount(eventId);
+                updateEventSubscribers(eventId, subscriberCount);
+
+                break;
+            }
+        }
+    }
+
+    public int getEventSubscribersCount(Long eventId) throws IOException {
+        List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
+        int count = 0;
+
+        for (Map<String, String> sub : allSubscriptions) {
+            if (String.valueOf(eventId).equals(sub.get("Event ID"))) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    public List<String> getEventSubscribersNames(Long eventId) throws IOException {
+        List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
+        List<String> names = new ArrayList<>();
+
+        for (Map<String, String> sub : allSubscriptions) {
+            if (String.valueOf(eventId).equals(sub.get("Event ID"))) {
+                names.add(sub.get("Name"));
+            }
+        }
+
+        return names;
+    }
+
+    // ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
+
+    private void createSheetsIfNeeded() throws IOException {
+        System.out.println("Проверка и создание листов в таблице...");
+
+        Spreadsheet spreadsheet = sheetsService.spreadsheets().get(SPREADSHEET_ID).execute();
+        Set<String> existingSheets = new HashSet<>();
+
+        for (Sheet sheet : spreadsheet.getSheets()) {
+            existingSheets.add(sheet.getProperties().getTitle());
+        }
+
+        // Создаем листы с нужными заголовками
+        String[] usersHeaders = {"ID", "Telegram ID", "Username", "Name", "Registered At"};
+        String[] eventsHeaders = {"ID", "Title", "Date", "Time", "Location", "Created By", "Subs Number", "Created At"};
+        String[] subsHeaders = {"ID", "Name", "Event ID", "Subscribed At"};
+
+        if (!existingSheets.contains("Users")) {
+            System.out.println("Создаю лист: Users");
+            createSheet("Users", usersHeaders);
+        }
+
+        if (!existingSheets.contains("Events")) {
+            System.out.println("Создаю лист: Events");
+            createSheet("Events", eventsHeaders);
+        }
+
+        if (!existingSheets.contains("Subscriptions")) {
+            System.out.println("Создаю лист: Subscriptions");
+            createSheet("Subscriptions", subsHeaders);
+        }
+    }
+
+    private void createSheet(String sheetName, String[] headers) throws IOException {
+        AddSheetRequest addSheetRequest = new AddSheetRequest();
+        SheetProperties sheetProperties = new SheetProperties();
+        sheetProperties.setTitle(sheetName);
+        addSheetRequest.setProperties(sheetProperties);
+
+        BatchUpdateSpreadsheetRequest batchUpdateRequest = new BatchUpdateSpreadsheetRequest();
+        batchUpdateRequest.setRequests(Collections.singletonList(
+                new Request().setAddSheet(addSheetRequest)
+        ));
+
+        sheetsService.spreadsheets().batchUpdate(SPREADSHEET_ID, batchUpdateRequest).execute();
+
+        // Добавляем заголовки
+        ValueRange headerRow = new ValueRange();
+        List<List<Object>> values = new ArrayList<>();
+        values.add(Arrays.asList(headers));
+        headerRow.setValues(values);
+
+        sheetsService.spreadsheets().values()
+                .update(SPREADSHEET_ID, sheetName + "!A1", headerRow)
+                .setValueInputOption("RAW")
+                .execute();
+    }
+
+    private List<Map<String, String>> getAllRows(String sheetName) throws IOException {
         ValueRange response = sheetsService.spreadsheets().values()
-                .get(spreadsheetId, sheetName)
+                .get(SPREADSHEET_ID, sheetName)
                 .execute();
 
         List<List<Object>> values = response.getValues();
@@ -314,7 +337,7 @@ public class GoogleSheetsService {
     }
 
     private Long getNextId(String sheetName) throws IOException {
-        List<Map<String, String>> data = getSheetData(sheetName);
+        List<Map<String, String>> data = getAllRows(sheetName);
 
         if (data.isEmpty()) {
             return 1L;
@@ -330,7 +353,7 @@ public class GoogleSheetsService {
                         maxId = id;
                     }
                 } catch (NumberFormatException e) {
-                    // игнорируем некорректные ID
+                    // игнорируем
                 }
             }
         }
@@ -339,8 +362,7 @@ public class GoogleSheetsService {
     }
 
     private void deleteRow(String sheetName, int rowIndex) throws IOException {
-        // Получаем ID листа
-        Spreadsheet spreadsheet = sheetsService.spreadsheets().get(spreadsheetId).execute();
+        Spreadsheet spreadsheet = sheetsService.spreadsheets().get(SPREADSHEET_ID).execute();
         Integer sheetId = null;
 
         for (Sheet sheet : spreadsheet.getSheets()) {
@@ -363,7 +385,7 @@ public class GoogleSheetsService {
                             new Request().setDeleteDimension(deleteRequest)
                     ));
 
-            sheetsService.spreadsheets().batchUpdate(spreadsheetId, batchUpdateRequest).execute();
+            sheetsService.spreadsheets().batchUpdate(SPREADSHEET_ID, batchUpdateRequest).execute();
         }
     }
 }
