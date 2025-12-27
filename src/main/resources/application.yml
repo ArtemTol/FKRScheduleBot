@@ -1,0 +1,7 @@
+google:
+  sheets:
+    spreadsheet-id: ${GOOGLE_SHEETS_ID:1p988SQ0sitghK-HOPzBIA4CjQYonKqUA5qp3vS99OgM}
+
+spring:
+  application:
+    name: fkr-schedule-tg-bot
