@@ -97,13 +97,14 @@ public class GoogleSheetsService {
                 time,
                 location,
                 createdBy,
+                creatorName,
                 0, // Начальное количество подписчиков
                 LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
         ));
 
         ValueRange body = new ValueRange().setValues(values);
         sheetsService.spreadsheets().values()
-                .append(SPREADSHEET_ID, "Events!A:H", body)
+                .append(SPREADSHEET_ID, "Events!A:I", body)
                 .setValueInputOption("RAW")
                 .execute();
 
@@ -131,6 +132,7 @@ public class GoogleSheetsService {
                 eventData.get("Time"),
                 eventData.get("Location"),
                 eventData.get("Created By"),
+                eventData.get("Creator Name"),
                 subscriberCount,
                 eventData.get("Created At")
         );
@@ -139,7 +141,7 @@ public class GoogleSheetsService {
         ValueRange body = new ValueRange().setValues(values);
 
         sheetsService.spreadsheets().values()
-                .update(SPREADSHEET_ID, "Events!A" + rowIndex + ":H" + rowIndex, body)
+                .update(SPREADSHEET_ID, "Events!A" + rowIndex + ":I" + rowIndex, body)
                 .setValueInputOption("RAW")
                 .execute();
     }
@@ -153,21 +155,80 @@ public class GoogleSheetsService {
         return getAllEvents();
     }
 
+    /**
+     * Получает сборы созданные пользователем
+     */
+    public List<Map<String, String>> getUserEvents(Long userId) throws IOException {
+        List<Map<String, String>> allEvents = getAllRows("Events");
+        List<Map<String, String>> userEvents = new ArrayList<>();
+
+        for (Map<String, String> event : allEvents) {
+            if (String.valueOf(userId).equals(event.get("Created By"))) {
+                userEvents.add(event);
+            }
+        }
+
+        return userEvents;
+    }
+
+    /**
+     * Отменяет сбор (удаляет или помечает как отмененный)
+     */
+    public void cancelEvent(Long eventId, Long userId) throws IOException {
+        // Можно либо удалить событие, либо добавить статус "cancelled"
+        // Простое решение: удаляем событие
+        List<Map<String, String>> events = getAllRows("Events");
+
+        for (int i = 0; i < events.size(); i++) {
+            Map<String, String> event = events.get(i);
+            if (String.valueOf(eventId).equals(event.get("ID")) &&
+                    String.valueOf(userId).equals(event.get("Created By"))) {
+
+                deleteRow("Events", i + 2);
+
+                // Также удаляем все подписки на это событие
+                deleteEventSubscriptions(eventId);
+
+                break;
+            }
+        }
+    }
+
+    /**
+     * Удаляет все подписки на событие
+     */
+    private void deleteEventSubscriptions(Long eventId) throws IOException {
+        List<Map<String, String>> subscriptions = getAllRows("Subscriptions");
+
+        // Удаляем с конца чтобы индексы не сбивались
+        for (int i = subscriptions.size() - 1; i >= 0; i--) {
+            Map<String, String> sub = subscriptions.get(i);
+            if (String.valueOf(eventId).equals(sub.get("Event ID"))) {
+                deleteRow("Subscriptions", i + 2);
+            }
+        }
+    }
+
     // ========== РАБОТА С ПОДПИСКАМИ ==========
 
     public void addSubscription(Long userId, Long eventId, String userName) throws IOException {
         Long nextId = getNextId("Subscriptions");
 
+        // Получаем username из таблицы Users
+        String username = getUsernameByTelegramId(userId);
+
         List<List<Object>> values = Arrays.asList(Arrays.asList(
                 nextId,
-                userName,
+                userId,         // Telegram ID
+                userName,       // Имя пользователя
+                username != null ? username : "",  // Username (@username)
                 eventId,
                 LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
         ));
 
         ValueRange body = new ValueRange().setValues(values);
         sheetsService.spreadsheets().values()
-                .append(SPREADSHEET_ID, "Subscriptions!A:D", body)
+                .append(SPREADSHEET_ID, "Subscriptions!A:F", body)
                 .setValueInputOption("RAW")
                 .execute();
 
@@ -179,10 +240,9 @@ public class GoogleSheetsService {
     public List<Map<String, String>> getUserSubscriptions(Long userId) throws IOException {
         List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
         List<Map<String, String>> userSubscriptions = new ArrayList<>();
-        String userName = getUserName(userId);
 
         for (Map<String, String> sub : allSubscriptions) {
-            if (userName.equals(sub.get("Name"))) {
+            if (String.valueOf(userId).equals(sub.get("User ID"))) {
                 userSubscriptions.add(sub);
             }
         }
@@ -191,21 +251,19 @@ public class GoogleSheetsService {
     }
 
     public boolean isUserSubscribed(Long userId, Long eventId) throws IOException {
-        List<Map<String, String>> subscriptions = getUserSubscriptions(userId);
-        String userName = getUserName(userId);
+        List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
 
-        return subscriptions.stream()
-                .anyMatch(sub -> userName.equals(sub.get("Name")) &&
+        return allSubscriptions.stream()
+                .anyMatch(sub -> String.valueOf(userId).equals(sub.get("User ID")) &&
                         String.valueOf(eventId).equals(sub.get("Event ID")));
     }
 
     public void deleteSubscription(Long userId, Long eventId) throws IOException {
         List<Map<String, String>> subscriptions = getAllRows("Subscriptions");
-        String userName = getUserName(userId);
 
         for (int i = 0; i < subscriptions.size(); i++) {
             Map<String, String> sub = subscriptions.get(i);
-            if (userName.equals(sub.get("Name")) &&
+            if (String.valueOf(userId).equals(sub.get("User ID")) &&
                     String.valueOf(eventId).equals(sub.get("Event ID"))) {
 
                 deleteRow("Subscriptions", i + 2); // +2 потому что первая строка заголовки
@@ -245,6 +303,70 @@ public class GoogleSheetsService {
         return names;
     }
 
+    // ========== НОВЫЕ МЕТОДЫ ДЛЯ СПИСКА ПОДПИСЧИКОВ ==========
+
+    /**
+     * Получает всех подписчиков на конкретное событие
+     */
+    public List<Map<String, String>> getEventSubscriptions(Long eventId) throws IOException {
+        List<Map<String, String>> allSubscriptions = getAllRows("Subscriptions");
+        List<Map<String, String>> eventSubscriptions = new ArrayList<>();
+
+        for (Map<String, String> sub : allSubscriptions) {
+            if (String.valueOf(eventId).equals(sub.get("Event ID"))) {
+                eventSubscriptions.add(sub);
+            }
+        }
+
+        return eventSubscriptions;
+    }
+
+    /**
+     * Получает событие по ID
+     */
+    public Map<String, String> getEventById(Long eventId) throws IOException {
+        List<Map<String, String>> allEvents = getAllRows("Events");
+
+        for (Map<String, String> event : allEvents) {
+            if (String.valueOf(eventId).equals(event.get("ID"))) {
+                return event;
+            }
+        }
+
+        return new HashMap<>(); // Возвращаем пустую мапу если не нашли
+    }
+
+    /**
+     * Получает Username пользователя по Telegram ID
+     */
+    public String getUsernameByTelegramId(Long telegramId) throws IOException {
+        List<Map<String, String>> allUsers = getAllRows("Users");
+
+        for (Map<String, String> user : allUsers) {
+            if (String.valueOf(telegramId).equals(user.get("Telegram ID"))) {
+                String username = user.get("Username");
+                return (username != null && !username.isEmpty() && !username.equals("null")) ? username : null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Получает информацию о пользователе по Telegram ID
+     */
+    public Map<String, String> getUserInfo(Long telegramId) throws IOException {
+        List<Map<String, String>> allUsers = getAllRows("Users");
+
+        for (Map<String, String> user : allUsers) {
+            if (String.valueOf(telegramId).equals(user.get("Telegram ID"))) {
+                return user;
+            }
+        }
+
+        return new HashMap<>();
+    }
+
     // ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
 
     private void createSheetsIfNeeded() throws IOException {
@@ -259,8 +381,8 @@ public class GoogleSheetsService {
 
         // Создаем листы с нужными заголовками
         String[] usersHeaders = {"ID", "Telegram ID", "Username", "Name", "Registered At"};
-        String[] eventsHeaders = {"ID", "Title", "Date", "Time", "Location", "Created By", "Subs Number", "Created At"};
-        String[] subsHeaders = {"ID", "Name", "Event ID", "Subscribed At"};
+        String[] eventsHeaders = {"ID", "Title", "Date", "Time", "Location", "Created By", "Creator Name", "Subs Number", "Created At"};
+        String[] subsHeaders = {"ID", "User ID", "Name", "Username", "Event ID", "Subscribed At"};
 
         if (!existingSheets.contains("Users")) {
             System.out.println("Создаю лист: Users");
@@ -387,5 +509,64 @@ public class GoogleSheetsService {
 
             sheetsService.spreadsheets().batchUpdate(SPREADSHEET_ID, batchUpdateRequest).execute();
         }
+    }
+
+    /**
+     * Обновляет информацию о событии
+     */
+    public void updateEvent(Long eventId, String title, String date, String time, String location) throws IOException {
+        List<Map<String, String>> events = getAllRows("Events");
+
+        for (int i = 0; i < events.size(); i++) {
+            Map<String, String> event = events.get(i);
+            if (String.valueOf(eventId).equals(event.get("ID"))) {
+                // Обновляем строку
+                List<Object> row = Arrays.asList(
+                        eventId,
+                        title,
+                        date,
+                        time,
+                        location,
+                        event.get("Created By"),
+                        event.get("Creator Name"),
+                        event.get("Subs Number"),
+                        event.get("Created At")
+                );
+
+                List<List<Object>> values = Arrays.asList(row);
+                ValueRange body = new ValueRange().setValues(values);
+
+                sheetsService.spreadsheets().values()
+                        .update(SPREADSHEET_ID, "Events!A" + (i + 2) + ":I" + (i + 2), body)
+                        .setValueInputOption("RAW")
+                        .execute();
+                break;
+            }
+        }
+    }
+
+    /**
+     * Проверяет, является ли пользователь создателем события
+     */
+    public boolean isEventCreator(Long userId, Long eventId) throws IOException {
+        Map<String, String> event = getEventById(eventId);
+        if (event.isEmpty()) {
+            return false;
+        }
+        return String.valueOf(userId).equals(event.get("Created By"));
+    }
+
+    /**
+     * Получает список всех пользователей
+     */
+    public List<Map<String, String>> getAllUsers() throws IOException {
+        return getAllRows("Users");
+    }
+
+    /**
+     * Получает список всех подписок
+     */
+    public List<Map<String, String>> getAllSubscriptions() throws IOException {
+        return getAllRows("Subscriptions");
     }
 }
