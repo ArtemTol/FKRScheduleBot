@@ -1,6 +1,6 @@
 package com.example.fkrscheduletgbot;
 
-import com.example.fkrscheduletgbot.service.GoogleSheetsService;
+import com.example.fkrscheduletgbot.service.PostgresDatabaseService;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
@@ -27,7 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
     private final TelegramClient telegramClient;
-    private final GoogleSheetsService sheetsService;
+    private final PostgresDatabaseService databaseService;
     private final Long botStartTime;
 
     // Состояния пользователей: awaiting_name - ждем имя, creating_event - создаем событие
@@ -38,11 +38,11 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     private final Map<Long, Long> editingEventId = new ConcurrentHashMap<>();
     private final Map<Long, String> editingField = new ConcurrentHashMap<>();
 
-    public UpdateConsumer(GoogleSheetsService sheetsService) {
+    public UpdateConsumer(PostgresDatabaseService databaseService) {
         this.telegramClient = new OkHttpTelegramClient("8023202316:AAF0l8dhfJCB6H1eifCz2QwYW66OQlcTk7M");
-        this.sheetsService = sheetsService;
+        this.databaseService = databaseService;
         this.botStartTime = System.currentTimeMillis();
-        System.out.println("UpdateConsumer инициализирован с GoogleSheetsService. Время запуска: " + botStartTime);
+        System.out.println("UpdateConsumer инициализирован с PostgresDatabaseService. Время запуска: " + botStartTime);
     }
 
     @Override
@@ -106,30 +106,31 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         if (state != null) {
             handleUserState(userId, chatId, messageText, state, username, firstName, lastName);
         } else if (messageText.equals("/start")) {
-            startRegistration(userId, chatId);
+            // Обработка команды /start
+            handleStartCommand(userId, chatId, username);
         } else if (messageText.equals("/cancel")) {
             cancelOperation(userId, chatId);
         }
         // Обработка reply-кнопок главного меню
-        else if (messageText.equals("Сборы")) {
+        else if (messageText.equals("📋 Сборы")) {
             if (userNames.containsKey(userId)) {
                 showAllEvents(chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Подписаться")) {
+        } else if (messageText.equals("✅ Подписаться")) {
             if (userNames.containsKey(userId)) {
                 showAvailableEvents(userId, chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Отписаться")) {
+        } else if (messageText.equals("❌ Отписаться")) {
             if (userNames.containsKey(userId)) {
                 showUserSubscriptions(userId, chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Модерация")) {
+        } else if (messageText.equals("⚙️ Модерация")) {
             if (userNames.containsKey(userId)) {
                 showModerationMenu(chatId);
             } else {
@@ -137,31 +138,31 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             }
         }
         // Обработка reply-кнопок меню модерации
-        else if (messageText.equals("Создать сбор")) {
+        else if (messageText.equals("➕ Создать сбор")) {
             if (userNames.containsKey(userId)) {
                 startEventCreation(userId, chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Редактировать сбор")) {
+        } else if (messageText.equals("✏️ Редактировать сбор")) {
             if (userNames.containsKey(userId)) {
                 showUserEventsForEditing(userId, chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Отменить сбор")) {
+        } else if (messageText.equals("❌ Отменить сбор")) {
             if (userNames.containsKey(userId)) {
                 showUserEventsForCancellation(userId, chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Подписчики")) {
+        } else if (messageText.equals("👥 Подписчики")) {
             if (userNames.containsKey(userId)) {
                 showEventsForSubscribers(chatId);
             } else {
                 sendMessage(chatId, "Пожалуйста, сначала введите /start для регистрации");
             }
-        } else if (messageText.equals("Назад")) {
+        } else if (messageText.equals("🔙 Назад")) {
             if (userNames.containsKey(userId)) {
                 showMainMenuKeyboard(chatId);
             }
@@ -173,6 +174,58 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 sendMessage(chatId, "Пожалуйста, введите /start для начала работы");
             }
         }
+    }
+
+    private void handleStartCommand(Long userId, Long chatId, String username) throws TelegramApiException {
+        // Проверяем, зарегистрирован ли пользователь в памяти бота
+        if (userNames.containsKey(userId)) {
+            // Пользователь уже в памяти - приветствуем
+            welcomeRegisteredUser(userId, chatId);
+            return;
+        }
+
+        // Проверяем, есть ли пользователь в базе данных
+        try {
+            if (databaseService.userExists(userId)) {
+                // Пользователь есть в базе - получаем его имя
+                String userName = databaseService.getUserName(userId);
+                if (userName != null && !userName.isEmpty() && !userName.equals("null")) {
+                    // Добавляем пользователя в память бота
+                    userNames.put(userId, userName);
+                    // Приветствуем
+                    welcomeRegisteredUser(userId, chatId);
+                } else {
+                    // Имя не найдено - начинаем регистрацию
+                    startRegistration(userId, chatId);
+                }
+            } else {
+                // Новый пользователь - начинаем регистрацию
+                startRegistration(userId, chatId);
+            }
+        } catch (Exception e) {
+            // Ошибка при обращении к базе данных - начинаем регистрацию
+            System.err.println("Ошибка при проверке пользователя: " + e.getMessage());
+            startRegistration(userId, chatId);
+        }
+    }
+
+    // Приветствие зарегистрированного пользователя
+    private void welcomeRegisteredUser(Long userId, Long chatId) throws TelegramApiException {
+        // Получаем имя пользователя
+        String userName = userNames.get(userId);
+        if (userName == null || userName.isEmpty()) {
+            // На всякий случай, если имя не найдено
+            sendMessage(chatId, "Добро пожаловать! Что-то пошло не так, попробуйте снова.");
+            showMainMenuKeyboard(chatId);
+            return;
+        }
+
+        // Простое приветствие
+        String welcomeMessage = "С возвращением, " + userName + "!\n" +
+                "Рады снова видеть вас!";
+
+        sendMessage(chatId, welcomeMessage);
+        showMainMenuKeyboard(chatId);
     }
 
     private void handleCallbackQuery(CallbackQuery callbackQuery) throws TelegramApiException, IOException {
@@ -191,6 +244,15 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             return;
         }
         if (data.equals("back_to_moderation")) {
+            showModerationMenu(chatId);
+            return;
+        }
+        if (data.equals("cancel_creation")) {
+            cancelOperation(userId, chatId);
+            return;
+        }
+        if (data.equals("cancel_editing")) {
+            cancelOperation(userId, chatId);
             showModerationMenu(chatId);
             return;
         }
@@ -250,20 +312,51 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         switch (state) {
             case "awaiting_name" -> {
                 String userName = messageText.trim();
+
+                // Валидация имени
                 if (userName.isEmpty()) {
                     sendMessage(chatId, "Имя не может быть пустым. Пожалуйста, введите ваше имя:");
                     return;
                 }
 
-                userNames.put(userId, userName);
-                userState.remove(userId);
-
-                // Регистрируем пользователя в Google Sheets
-                if (!sheetsService.userExists(userId)) {
-                    sheetsService.addUser(userId, username, userName);
+                if (userName.length() > 50) {
+                    sendMessage(chatId, "Имя слишком длинное. Максимум 50 символов. Введите имя заново:");
+                    return;
                 }
 
-                sendMessage(chatId, "Регистрация завершена! Добро пожаловать, " + userName + "!");
+                if (!userName.matches("^[А-Яа-яЁё\\s]+$")) {
+                    sendMessage(chatId, "Имя может содержать только русские буквы и пробелы. Введите имя заново:");
+                    return;
+                }
+
+                if (userName.trim().isEmpty()) {
+                    sendMessage(chatId, "Имя не может состоять только из пробелов. Введите ваше имя:");
+                    return;
+                }
+
+                if (userName.contains("  ")) {
+                    sendMessage(chatId, "Имя не должно содержать несколько пробелов подряд. Введите имя заново:");
+                    return;
+                }
+
+                if (!Character.isLetter(userName.charAt(0))) {
+                    sendMessage(chatId, "Имя должно начинаться с буквы. Введите имя заново:");
+                    return;
+                }
+
+                // Форматируем имя
+                String formattedName = formatUserName(userName);
+
+                // Сохраняем имя
+                userNames.put(userId, formattedName);
+                userState.remove(userId);
+
+                // Регистрируем пользователя в базе данных
+                if (!databaseService.userExists(userId)) {
+                    databaseService.addUser(userId, username, formattedName);
+                }
+
+                sendMessage(chatId, "Регистрация завершена! Добро пожаловать, " + formattedName + "!");
                 showMainMenuKeyboard(chatId);
             }
 
@@ -324,11 +417,17 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 }
 
                 try {
-                    Map<String, String> event = sheetsService.getEventById(eventId);
-                    sheetsService.updateEvent(eventId, messageText,
+                    Map<String, String> event = databaseService.getEventById(eventId);
+                    if (event.isEmpty()) {
+                        sendMessage(chatId, "Сбор не найден.");
+                        showModerationMenu(chatId);
+                        return;
+                    }
+
+                    databaseService.updateEvent(eventId, messageText,
                             event.get("Date"), event.get("Time"), event.get("Location"));
 
-                    sendMessage(chatId, "Название сбора обновлено на: " + messageText);
+                    sendMessage(chatId, "✅ Название сбора обновлено на: " + messageText);
 
                     // Очищаем состояние
                     userState.remove(userId);
@@ -338,7 +437,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     showModerationMenu(chatId);
 
                 } catch (Exception e) {
-                    sendMessage(chatId, "Ошибка при обновлении названия: " + e.getMessage());
+                    sendMessage(chatId, "❌ Ошибка при обновлении названия: " + e.getMessage());
                     showModerationMenu(chatId);
                 }
             }
@@ -355,11 +454,17 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy");
                     LocalDate.parse(messageText, formatter);
 
-                    Map<String, String> event = sheetsService.getEventById(eventId);
-                    sheetsService.updateEvent(eventId, event.get("Title"),
+                    Map<String, String> event = databaseService.getEventById(eventId);
+                    if (event.isEmpty()) {
+                        sendMessage(chatId, "Сбор не найден.");
+                        showModerationMenu(chatId);
+                        return;
+                    }
+
+                    databaseService.updateEvent(eventId, event.get("Title"),
                             messageText, event.get("Time"), event.get("Location"));
 
-                    sendMessage(chatId, "Дата сбора обновлена на: " + messageText);
+                    sendMessage(chatId, "✅ Дата сбора обновлена на: " + messageText);
 
                     // Очищаем состояние
                     userState.remove(userId);
@@ -371,7 +476,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 } catch (DateTimeParseException e) {
                     sendMessage(chatId, "Неверный формат даты! Введите дату в формате ДД.ММ.ГГГГ:");
                 } catch (Exception e) {
-                    sendMessage(chatId, "Ошибка при обновлении даты: " + e.getMessage());
+                    sendMessage(chatId, "❌ Ошибка при обновлении даты: " + e.getMessage());
                     showModerationMenu(chatId);
                 }
             }
@@ -388,11 +493,17 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm");
                     LocalTime.parse(messageText, formatter);
 
-                    Map<String, String> event = sheetsService.getEventById(eventId);
-                    sheetsService.updateEvent(eventId, event.get("Title"),
+                    Map<String, String> event = databaseService.getEventById(eventId);
+                    if (event.isEmpty()) {
+                        sendMessage(chatId, "Сбор не найден.");
+                        showModerationMenu(chatId);
+                        return;
+                    }
+
+                    databaseService.updateEvent(eventId, event.get("Title"),
                             event.get("Date"), messageText, event.get("Location"));
 
-                    sendMessage(chatId, "Время сбора обновлено на: " + messageText);
+                    sendMessage(chatId, "✅ Время сбора обновлено на: " + messageText);
 
                     // Очищаем состояние
                     userState.remove(userId);
@@ -404,7 +515,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 } catch (DateTimeParseException e) {
                     sendMessage(chatId, "Неверный формат времени! Введите время в формате ЧЧ:ММ:");
                 } catch (Exception e) {
-                    sendMessage(chatId, "Ошибка при обновлении времени: " + e.getMessage());
+                    sendMessage(chatId, "❌ Ошибка при обновлении времени: " + e.getMessage());
                     showModerationMenu(chatId);
                 }
             }
@@ -418,11 +529,17 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 }
 
                 try {
-                    Map<String, String> event = sheetsService.getEventById(eventId);
-                    sheetsService.updateEvent(eventId, event.get("Title"),
+                    Map<String, String> event = databaseService.getEventById(eventId);
+                    if (event.isEmpty()) {
+                        sendMessage(chatId, "Сбор не найден.");
+                        showModerationMenu(chatId);
+                        return;
+                    }
+
+                    databaseService.updateEvent(eventId, event.get("Title"),
                             event.get("Date"), event.get("Time"), messageText);
 
-                    sendMessage(chatId, "Место сбора обновлено на: " + messageText);
+                    sendMessage(chatId, "✅ Место сбора обновлено на: " + messageText);
 
                     // Очищаем состояние
                     userState.remove(userId);
@@ -432,7 +549,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     showModerationMenu(chatId);
 
                 } catch (Exception e) {
-                    sendMessage(chatId, "Ошибка при обновлении места: " + e.getMessage());
+                    sendMessage(chatId, "❌ Ошибка при обновлении места: " + e.getMessage());
                     showModerationMenu(chatId);
                 }
             }
@@ -446,13 +563,29 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
     private void startEventCreation(Long userId, Long chatId) throws TelegramApiException {
         userState.put(userId, "awaiting_event_title");
-        sendMessage(chatId, "Создание нового сбора. Введите название сбора:");
+
+        SendMessage message = SendMessage.builder()
+                .chatId(chatId)
+                .text("Создание нового сбора. Введите название сбора:\n\n" +
+                        "Для отмены создания нажмите кнопку ниже:")
+                .build();
+
+        // inline-кнопка отмены
+        List<InlineKeyboardRow> rows = new ArrayList<>();
+        InlineKeyboardButton cancelButton = InlineKeyboardButton.builder()
+                .text("❌ Отменить создание")
+                .callbackData("cancel_creation")
+                .build();
+        rows.add(new InlineKeyboardRow(cancelButton));
+
+        message.setReplyMarkup(new InlineKeyboardMarkup(rows));
+        telegramClient.execute(message);
     }
 
     private void startEventEditing(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
             // Проверяем, является ли пользователь создателем события
-            if (!sheetsService.isEventCreator(userId, eventId)) {
+            if (!databaseService.isEventCreator(userId, eventId)) {
                 sendMessage(chatId, "Вы не являетесь создателем этого сбора.");
                 showModerationMenu(chatId);
                 return;
@@ -465,13 +598,13 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             showEditEventMenu(userId, chatId, eventId);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка: " + e.getMessage());
             showModerationMenu(chatId);
         }
     }
 
     private void showEditEventMenu(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
-        Map<String, String> event = sheetsService.getEventById(eventId);
+        Map<String, String> event = databaseService.getEventById(eventId);
 
         if (event.isEmpty()) {
             sendMessage(chatId, "Сбор не найден.");
@@ -479,12 +612,19 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             return;
         }
 
+        // Получаем username организатора
+        Long creatorId = Long.parseLong(event.get("Created By"));
+        String organizerName = event.get("Creator Name");
+        String organizerUsername = databaseService.getUsernameByTelegramId(creatorId);
+        String organizerInfo = formatOrganizerInfo(organizerName, organizerUsername);
+
         // Показываем информацию о событии и меню редактирования
-        String eventInfo = "Редактирование сбора:\n\n" +
+        String eventInfo = "✏️ Редактирование сбора:\n\n" +
                 "📌 Название: " + event.get("Title") + "\n" +
                 "📅 Дата: " + event.get("Date") + "\n" +
                 "⏰ Время: " + event.get("Time") + "\n" +
-                "📍 Место: " + event.get("Location") + "\n\n" +
+                "📍 Место: " + event.get("Location") + "\n" +
+                "👤 Организатор: " + organizerInfo + "\n\n" +
                 "Что вы хотите изменить?";
 
         SendMessage message = SendMessage.builder()
@@ -495,28 +635,28 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         List<InlineKeyboardRow> rows = new ArrayList<>();
 
         InlineKeyboardButton titleButton = InlineKeyboardButton.builder()
-                .text("Название")
+                .text("✏️ Название")
                 .callbackData("edit_title_" + eventId)
                 .build();
 
         InlineKeyboardButton dateButton = InlineKeyboardButton.builder()
-                .text("Дату")
+                .text("📅 Дата")
                 .callbackData("edit_date_" + eventId)
                 .build();
 
         InlineKeyboardButton timeButton = InlineKeyboardButton.builder()
-                .text("Время")
+                .text("⏰ Время")
                 .callbackData("edit_time_" + eventId)
                 .build();
 
         InlineKeyboardButton locationButton = InlineKeyboardButton.builder()
-                .text("Место")
+                .text("📍 Место")
                 .callbackData("edit_location_" + eventId)
                 .build();
 
         InlineKeyboardButton cancelButton = InlineKeyboardButton.builder()
-                .text("Отменить редактирование")
-                .callbackData("back_to_moderation")
+                .text("❌ Отменить редактирование")
+                .callbackData("cancel_editing")
                 .build();
 
         rows.add(new InlineKeyboardRow(titleButton));
@@ -532,13 +672,13 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
     private void cancelEvent(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
             // Проверяем, является ли пользователь создателем события
-            if (!sheetsService.isEventCreator(userId, eventId)) {
+            if (!databaseService.isEventCreator(userId, eventId)) {
                 sendMessage(chatId, "Вы не являетесь создателем этого сбора.");
                 showModerationMenu(chatId);
                 return;
             }
 
-            Map<String, String> event = sheetsService.getEventById(eventId);
+            Map<String, String> event = databaseService.getEventById(eventId);
 
             if (event.isEmpty()) {
                 sendMessage(chatId, "Сбор не найден.");
@@ -546,11 +686,18 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 return;
             }
 
+            // Получаем username организатора
+            Long creatorId = Long.parseLong(event.get("Created By"));
+            String organizerName = event.get("Creator Name");
+            String organizerUsername = databaseService.getUsernameByTelegramId(creatorId);
+            String organizerInfo = formatOrganizerInfo(organizerName, organizerUsername);
+
             // Показываем подтверждение отмены
-            String confirmationText = "Вы уверены, что хотите отменить сбор?\n\n" +
+            String confirmationText = "❌ Вы уверены, что хотите отменить сбор?\n\n" +
                     "📌 Название: " + event.get("Title") + "\n" +
                     "📅 Дата: " + event.get("Date") + " " + event.get("Time") + "\n" +
-                    "📍 Место: " + event.get("Location") + "\n\n" +
+                    "📍 Место: " + event.get("Location") + "\n" +
+                    "👤 Организатор: " + organizerInfo + "\n\n" +
                     "Отмена сбора удалит его и все подписки!";
 
             SendMessage message = SendMessage.builder()
@@ -577,7 +724,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             telegramClient.execute(message);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка: " + e.getMessage());
             showModerationMenu(chatId);
         }
     }
@@ -586,7 +733,12 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             throws TelegramApiException, IOException {
         try {
             String userName = userNames.get(userId);
-            Long eventId = sheetsService.addEvent(
+
+            // Получаем username пользователя
+            String username = databaseService.getUsernameByTelegramId(userId);
+            String organizerInfo = formatOrganizerInfo(userName, username);
+
+            Long eventId = databaseService.addEvent(
                     eventData.get("title"),
                     eventData.get("date"),
                     eventData.get("time"),
@@ -595,16 +747,19 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                     userName
             );
 
-            sendMessage(chatId, "Сбор успешно создан!\n\n" +
-                    "Название: " + eventData.get("title") + "\n" +
-                    "Дата: " + eventData.get("date") + "\n" +
-                    "Время: " + eventData.get("time") + "\n" +
-                    "Место: " + eventData.get("location"));
+            String response = "✅ Сбор успешно создан!\n\n" +
+                    "📌 Название: " + eventData.get("title") + "\n" +
+                    "📅 Дата: " + eventData.get("date") + "\n" +
+                    "⏰ Время: " + eventData.get("time") + "\n" +
+                    "📍 Место: " + eventData.get("location") + "\n" +
+                    "👤 Организатор: " + organizerInfo;
 
+            sendMessage(chatId, response);
             showMainMenuKeyboard(chatId);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка при создании сбора: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка при создании сбора: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -612,7 +767,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             throws TelegramApiException, IOException {
 
         try {
-            if (!sheetsService.isEventCreator(userId, eventId)) {
+            if (!databaseService.isEventCreator(userId, eventId)) {
                 sendMessage(chatId, "Вы не являетесь создателем этого сбора.");
                 showModerationMenu(chatId);
                 return;
@@ -626,16 +781,15 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             sendMessage(chatId, prompt);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка: " + e.getMessage());
             showModerationMenu(chatId);
         }
     }
 
     private void confirmEventCancellation(Long userId, Long chatId, Long eventId)
             throws TelegramApiException, IOException {
-
         try {
-            Map<String, String> event = sheetsService.getEventById(eventId);
+            Map<String, String> event = databaseService.getEventById(eventId);
 
             if (event.isEmpty()) {
                 sendMessage(chatId, "Сбор не найден.");
@@ -643,54 +797,80 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                 return;
             }
 
-            // Отменяем сбор
-            sheetsService.cancelEvent(eventId, userId);
+            // Получаем username организатора
+            Long creatorId = Long.parseLong(event.get("Created By"));
+            String organizerName = event.get("Creator Name");
+            String organizerUsername = databaseService.getUsernameByTelegramId(creatorId);
+            String organizerInfo = formatOrganizerInfo(organizerName, organizerUsername);
 
-            // Получаем количество подписчиков для уведомления
-            int subscriberCount = sheetsService.getEventSubscribersCount(eventId);
+            // Отменяем сбор
+            databaseService.cancelEvent(eventId, userId);
+
+            // Получаем количество подписчиков
+            int subscriberCount = databaseService.getEventSubscribersCount(eventId);
 
             // Отправляем сообщение об успешной отмене
-            String successMessage = "Сбор успешно отменен!\n\n" +
-                    "Название: " + event.get("Title") + "\n" +
-                    "Дата: " + event.get("Date") + " " + event.get("Time") + "\n" +
-                    "Место: " + event.get("Location") + "\n" +
-                    "Удалено подписок: " + subscriberCount;
+            String successMessage = "✅ Сбор успешно отменен!\n\n" +
+                    "📌 Название: " + event.get("Title") + "\n" +
+                    "📅 Дата: " + event.get("Date") + " " + event.get("Time") + "\n" +
+                    "📍 Место: " + event.get("Location") + "\n" +
+                    "👤 Организатор: " + organizerInfo + "\n" +
+                    "🗑️ Удалено подписок: " + subscriberCount;
 
             sendMessage(chatId, successMessage);
             showModerationMenu(chatId);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка при отмене сбора: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка при отмене сбора: " + e.getMessage());
             showModerationMenu(chatId);
         }
     }
 
     private void showAvailableEvents(Long userId, Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> events = sheetsService.getActiveEvents();
-        List<Map<String, String>> userSubscriptions = sheetsService.getUserSubscriptions(userId);
+        List<Map<String, String>> events = databaseService.getActiveEvents();
+        List<Map<String, String>> userSubscriptions = databaseService.getUserSubscriptions(userId);
 
         // Фильтруем события, на которые пользователь не подписан
-        Set<String> subscribedEventIds = new HashSet<>();
+        Set<Long> subscribedEventIds = new HashSet<>();
         for (Map<String, String> sub : userSubscriptions) {
-            subscribedEventIds.add(sub.get("Event ID"));
+            try {
+                subscribedEventIds.add(Long.parseLong(sub.get("Event ID")));
+            } catch (NumberFormatException e) {
+                // Игнорируем некорректные ID
+            }
         }
 
         List<Map<String, String>> availableEvents = new ArrayList<>();
         for (Map<String, String> event : events) {
-            if (!subscribedEventIds.contains(event.get("ID"))) {
+            try {
+                Long eventId = Long.parseLong(event.get("ID"));
+
+                // Пропускаем если пользователь уже подписан
+                if (subscribedEventIds.contains(eventId)) {
+                    continue;
+                }
+
+                // Пропускаем если пользователь организатор
+                Long createdBy = Long.parseLong(event.get("Created By"));
+                if (createdBy.equals(userId)) {
+                    continue;
+                }
+
                 availableEvents.add(event);
+            } catch (NumberFormatException e) {
+                // Игнорируем некорректные записи
             }
         }
 
         if (availableEvents.isEmpty()) {
-            sendMessage(chatId, "Нет доступных сборов для подписки.");
+            sendMessage(chatId, "📭 Нет доступных сборов для подписки.");
             showMainMenuKeyboard(chatId);
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("Доступные сборы для подписки:")
+                .text("📋 Доступные сборы для подписки:")
                 .build();
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
@@ -709,37 +889,32 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             rows.add(new InlineKeyboardRow(button));
         }
 
-        InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("Назад")
-                .callbackData("back")
-                .build();
-        rows.add(new InlineKeyboardRow(backButton));
-
         message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showUserSubscriptions(Long userId, Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> userSubscriptions = sheetsService.getUserSubscriptions(userId);
+        List<Map<String, String>> userSubscriptions = databaseService.getUserSubscriptions(userId);
 
         if (userSubscriptions.isEmpty()) {
-            sendMessage(chatId, "Вы не подписаны ни на один сбор.");
+            sendMessage(chatId, "📭 Вы не подписаны ни на один сбор.");
             showMainMenuKeyboard(chatId);
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("Ваши подписки:")
+                .text("📋 Ваши подписки:")
                 .build();
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
 
         for (Map<String, String> sub : userSubscriptions) {
-            // Находим событие
-            List<Map<String, String>> events = sheetsService.getAllEvents();
-            for (Map<String, String> event : events) {
-                if (event.get("ID").equals(sub.get("Event ID"))) {
+            try {
+                Long eventId = Long.parseLong(sub.get("Event ID"));
+                Map<String, String> event = databaseService.getEventById(eventId);
+
+                if (!event.isEmpty()) {
                     String buttonText = event.get("Title") + " - " + event.get("Date") + " " + event.get("Time");
                     if (buttonText.length() > 64) {
                         buttonText = buttonText.substring(0, 61) + "...";
@@ -751,33 +926,28 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
                             .build();
 
                     rows.add(new InlineKeyboardRow(button));
-                    break;
                 }
+            } catch (Exception e) {
+                // Игнорируем некорректные записи
             }
         }
-
-        InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("Назад")
-                .callbackData("back")
-                .build();
-        rows.add(new InlineKeyboardRow(backButton));
 
         message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showUserEventsForEditing(Long userId, Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> userEvents = sheetsService.getUserEvents(userId);
+        List<Map<String, String>> userEvents = databaseService.getUserEvents(userId);
 
         if (userEvents.isEmpty()) {
-            sendMessage(chatId, "У вас нет сборов для редактирования.");
+            sendMessage(chatId, "✏️ У вас нет сборов для редактирования.");
             showModerationMenu(chatId);
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("Выберите сбор для редактирования:")
+                .text("✏️ Выберите сбор для редактирования:")
                 .build();
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
@@ -796,28 +966,22 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             rows.add(new InlineKeyboardRow(button));
         }
 
-        InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("Назад")
-                .callbackData("back_to_moderation")
-                .build();
-        rows.add(new InlineKeyboardRow(backButton));
-
         message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showUserEventsForCancellation(Long userId, Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> userEvents = sheetsService.getUserEvents(userId);
+        List<Map<String, String>> userEvents = databaseService.getUserEvents(userId);
 
         if (userEvents.isEmpty()) {
-            sendMessage(chatId, "У вас нет сборов для отмены.");
+            sendMessage(chatId, "❌ У вас нет сборов для отмены.");
             showModerationMenu(chatId);
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("Выберите сбор для отмены:")
+                .text("❌ Выберите сбор для отмены:")
                 .build();
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
@@ -836,28 +1000,22 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             rows.add(new InlineKeyboardRow(button));
         }
 
-        InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("Назад")
-                .callbackData("back_to_moderation")
-                .build();
-        rows.add(new InlineKeyboardRow(backButton));
-
         message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showEventsForSubscribers(Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> events = sheetsService.getActiveEvents();
+        List<Map<String, String>> events = databaseService.getActiveEvents();
 
         if (events.isEmpty()) {
-            sendMessage(chatId, "Нет активных сборов.");
+            sendMessage(chatId, "📭 Нет активных сборов.");
             showMainMenuKeyboard(chatId);
             return;
         }
 
         SendMessage message = SendMessage.builder()
                 .chatId(chatId)
-                .text("Выберите сбор для просмотра подписчиков:")
+                .text("👥 Выберите сбор для просмотра подписчиков:")
                 .build();
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
@@ -876,54 +1034,40 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             rows.add(new InlineKeyboardRow(button));
         }
 
-        InlineKeyboardButton backButton = InlineKeyboardButton.builder()
-                .text("Назад")
-                .callbackData("back")
-                .build();
-        rows.add(new InlineKeyboardRow(backButton));
-
         message.setReplyMarkup(new InlineKeyboardMarkup(rows));
         telegramClient.execute(message);
     }
 
     private void showEventSubscribers(Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
-            // Получаем подписки на событие
-            List<Map<String, String>> subscriptions = sheetsService.getEventSubscriptions(eventId);
+            List<Map<String, String>> subscriptions = databaseService.getEventSubscriptions(eventId);
+            Map<String, String> event = databaseService.getEventById(eventId);
 
             if (subscriptions.isEmpty()) {
-                sendMessage(chatId, "На этот сбор пока никто не подписался.");
+                sendMessage(chatId, "👥 На этот сбор пока никто не подписался.");
                 showMainMenuKeyboard(chatId);
                 return;
             }
 
-            // Получаем информацию о событии
-            Map<String, String> event = sheetsService.getEventById(eventId);
+            // Получаем username организатора
+            Long creatorId = Long.parseLong(event.get("Created By"));
+            String organizerName = event.get("Creator Name");
+            String organizerUsername = databaseService.getUsernameByTelegramId(creatorId);
+            String organizerInfo = formatOrganizerInfo(organizerName, organizerUsername);
 
             StringBuilder messageText = new StringBuilder();
-            messageText.append("Сбор: ").append(event.get("Title")).append("\n");
-            messageText.append("Дата: ").append(event.get("Date")).append(" ").append(event.get("Time")).append("\n");
-            messageText.append("Место: ").append(event.get("Location")).append("\n\n");
-            messageText.append("Подписчики (").append(subscriptions.size()).append("):\n\n");
+            messageText.append("📌 Сбор: ").append(event.get("Title")).append("\n");
+            messageText.append("📅 Дата: ").append(event.get("Date")).append(" ").append(event.get("Time")).append("\n");
+            messageText.append("📍 Место: ").append(event.get("Location")).append("\n");
+            messageText.append("👤 Организатор: ").append(organizerInfo).append("\n\n");
+            messageText.append("👥 Подписчики (").append(subscriptions.size()).append("):\n\n");
 
             for (int i = 0; i < subscriptions.size(); i++) {
                 Map<String, String> sub = subscriptions.get(i);
                 String name = sub.get("Name");
                 String username = sub.get("Username");
 
-                // Формируем строку: "Имя (@username)" или "Имя" если нет username
-                String userLine = (i + 1) + ". ";
-
-                if (name != null && !name.isEmpty() && !name.equals("null")) {
-                    userLine += name;
-                } else {
-                    userLine += "Неизвестный";
-                }
-
-                if (username != null && !username.isEmpty() && !username.equals("null") && !username.equals("")) {
-                    userLine += " (@" + username + ")";
-                }
-
+                String userLine = (i + 1) + ". " + formatOrganizerInfo(name, username);
                 messageText.append(userLine).append("\n");
             }
 
@@ -931,28 +1075,36 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
             showMainMenuKeyboard(chatId);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка при получении списка подписчиков: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка при получении списка подписчиков: " + e.getMessage());
+            e.printStackTrace();
             showMainMenuKeyboard(chatId);
         }
     }
 
     private void showAllEvents(Long chatId) throws TelegramApiException, IOException {
-        List<Map<String, String>> events = sheetsService.getActiveEvents();
+        List<Map<String, String>> events = databaseService.getActiveEvents();
 
         if (events.isEmpty()) {
-            sendMessage(chatId, "Нет запланированных сборов.");
+            sendMessage(chatId, "📭 Нет запланированных сборов.");
             showMainMenuKeyboard(chatId);
             return;
         }
 
-        StringBuilder messageText = new StringBuilder("Все сборы:\n\n");
+        StringBuilder messageText = new StringBuilder("📋 Все сборы:\n\n");
 
         for (Map<String, String> event : events) {
-            messageText.append("Название: ").append(event.get("Title")).append("\n")
-                    .append("Дата: ").append(event.get("Date")).append("\n")
-                    .append("Время: ").append(event.get("Time")).append("\n")
-                    .append("Место: ").append(event.get("Location")).append("\n")
-                    .append("Подписчиков: ").append(event.get("Subs Number")).append("\n\n");
+            // Получаем username организатора
+            Long creatorId = Long.parseLong(event.get("Created By"));
+            String organizerName = event.get("Creator Name");
+            String organizerUsername = databaseService.getUsernameByTelegramId(creatorId);
+            String organizerInfo = formatOrganizerInfo(organizerName, organizerUsername);
+
+            messageText.append("📌 Название: ").append(event.get("Title")).append("\n")
+                    .append("📅 Дата: ").append(event.get("Date")).append("\n")
+                    .append("⏰ Время: ").append(event.get("Time")).append("\n")
+                    .append("📍 Место: ").append(event.get("Location")).append("\n")
+                    .append("👤 Организатор: ").append(organizerInfo).append("\n")
+                    .append("👥 Подписчиков: ").append(event.get("Subs Number")).append("\n\n");
         }
 
         sendMessage(chatId, messageText.toString());
@@ -961,36 +1113,47 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
     private void subscribeToEvent(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
-            if (sheetsService.isUserSubscribed(userId, eventId)) {
+            // Проверяем, не является ли пользователь организатором
+            if (databaseService.isEventCreator(userId, eventId)) {
+                sendMessage(chatId, "Вы являетесь организатором этого сбора и не можете на него подписаться.");
+                showMainMenuKeyboard(chatId);
+                return;
+            }
+
+            if (databaseService.isUserSubscribed(userId, eventId)) {
                 sendMessage(chatId, "Вы уже подписаны на этот сбор.");
                 showMainMenuKeyboard(chatId);
                 return;
             }
 
             String userName = userNames.get(userId);
-            sheetsService.addSubscription(userId, eventId, userName);
-            sendMessage(chatId, "Вы успешно подписались на сбор!");
+            databaseService.addSubscription(userId, eventId, userName);
+            sendMessage(chatId, "✅ Вы успешно подписались на сбор!");
             showMainMenuKeyboard(chatId);
 
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка при подписке: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка при подписке: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
     private void unsubscribeFromEvent(Long userId, Long chatId, Long eventId) throws TelegramApiException, IOException {
         try {
-            sheetsService.deleteSubscription(userId, eventId);
-            sendMessage(chatId, "Вы отписались от сбора.");
+            databaseService.deleteSubscription(userId, eventId);
+            sendMessage(chatId, "✅ Вы отписались от сбора.");
             showMainMenuKeyboard(chatId);
         } catch (Exception e) {
-            sendMessage(chatId, "Ошибка при отписке: " + e.getMessage());
+            sendMessage(chatId, "❌ Ошибка при отписке: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
     private void cancelOperation(Long userId, Long chatId) throws TelegramApiException {
         userState.remove(userId);
         userEventData.remove(userId);
-        sendMessage(chatId, "Операция отменена.");
+        editingEventId.remove(userId);
+        editingField.remove(userId);
+        sendMessage(chatId, "❌ Операция отменена.");
         showMainMenuKeyboard(chatId);
     }
 
@@ -1003,7 +1166,8 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         try {
             telegramClient.execute(message);
         } catch (TelegramApiException e) {
-            throw new RuntimeException(e);
+            System.err.println("Ошибка отправки сообщения: " + e.getMessage());
+            throw e;
         }
     }
 
@@ -1013,16 +1177,16 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
         // Основные действия для всех
         KeyboardRow row1 = new KeyboardRow();
-        row1.add("Сборы");          // Просмотр всех сборов
+        row1.add("📋 Сборы");          // Просмотр всех сборов
 
         KeyboardRow row2 = new KeyboardRow();
-        row2.add("Подписаться");    // Подписаться на сбор
+        row2.add("✅ Подписаться");    // Подписаться на сбор
 
         KeyboardRow row3 = new KeyboardRow();
-        row3.add("Отписаться");     // Отписаться от сбора
+        row3.add("❌ Отписаться");     // Отписаться от сбора
 
         KeyboardRow row4 = new KeyboardRow();
-        row4.add("Модерация");      // Меню модерации
+        row4.add("⚙️ Модерация");      // Меню модерации
 
         keyboard.add(row1);
         keyboard.add(row2);
@@ -1034,7 +1198,7 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         replyMarkup.setOneTimeKeyboard(false);
 
         SendMessage message = SendMessage.builder()
-                .text("Главное меню. Выберите действие:")
+                .text("📱 Главное меню. Выберите действие:")
                 .chatId(chatId)
                 .replyMarkup(replyMarkup)
                 .build();
@@ -1048,19 +1212,19 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
         // Действия модератора/организатора
         KeyboardRow row1 = new KeyboardRow();
-        row1.add("Создать сбор");
+        row1.add("➕ Создать сбор");
 
         KeyboardRow row2 = new KeyboardRow();
-        row2.add("Редактировать сбор");
+        row2.add("✏️ Редактировать сбор");
 
         KeyboardRow row3 = new KeyboardRow();
-        row3.add("Отменить сбор");
+        row3.add("❌ Отменить сбор");
 
         KeyboardRow row4 = new KeyboardRow();
-        row4.add("Подписчики");
+        row4.add("👥 Подписчики");
 
         KeyboardRow row5 = new KeyboardRow();
-        row5.add("Назад");
+        row5.add("🔙 Назад");
 
         keyboard.add(row1);
         keyboard.add(row2);
@@ -1072,11 +1236,50 @@ public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
         replyMarkup.setResizeKeyboard(true);
 
         SendMessage message = SendMessage.builder()
-                .text("Меню модерации:")
+                .text("⚙️ Меню модерации:")
                 .chatId(chatId)
                 .replyMarkup(replyMarkup)
                 .build();
 
         telegramClient.execute(message);
+    }
+
+    // Формат вывода организатора
+    private String formatOrganizerInfo(String name, String username) {
+        if (name == null || name.isEmpty() || name.equals("null")) {
+            name = "Неизвестный";
+        }
+
+        // Если есть username, добавляем @тег
+        if (username != null && !username.isEmpty() && !username.equals("null")) {
+            return name + " (@" + username + ")";
+        }
+
+        // Если нет username, показываем просто имя
+        return name;
+    }
+
+    private String formatUserName(String name) {
+        if (name == null || name.isEmpty()) {
+            return name;
+        }
+
+        // Убираем лишние пробелы
+        name = name.trim().replaceAll("\\s+", " ");
+
+        // Разделяем на слова
+        String[] words = name.split(" ");
+        StringBuilder result = new StringBuilder();
+
+        for (String word : words) {
+            if (!word.isEmpty()) {
+                // Делаем первую букву заглавной, остальные строчные
+                String capitalizedWord = word.substring(0, 1).toUpperCase() +
+                        word.substring(1).toLowerCase();
+                result.append(capitalizedWord).append(" ");
+            }
+        }
+
+        return result.toString().trim();
     }
 }
